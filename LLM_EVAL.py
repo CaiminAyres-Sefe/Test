@@ -139,6 +139,28 @@ try:
 except Exception:
     langfuse.create_dataset(name=DATASET_NAME, description="Offline eval set built from digibot traces")
 
+def _list_existing_dataset_entries(dataset_name: str, page_size: int = 100):
+    """Return (existing_item_ids, existing_source_trace_ids) for the dataset."""
+    existing_item_ids = set()
+    existing_source_trace_ids = set()
+    page = 1
+    while True:
+        resp = langfuse.api.dataset_items.list(dataset_name=dataset_name, page=page, limit=page_size)
+        data = getattr(resp, "data", None) or []
+        if not data:
+            break
+        for it in data:
+            it_id = getattr(it, "id", None)
+            if it_id:
+                existing_item_ids.add(it_id)
+            stid = getattr(it, "source_trace_id", None)
+            if stid is not None:
+                existing_source_trace_ids.add(str(stid))
+        if len(data) < page_size:
+            break
+        page += 1
+    return existing_item_ids, existing_source_trace_ids
+
 def pick_best_io(trace):
     ti, to = getattr(trace, "input", None), getattr(trace, "output", None)
     if ti is not None or to is not None:
@@ -155,17 +177,23 @@ def pick_best_io(trace):
             return oi, oo, getattr(o, "id", None)
     return None, None, None
 
-created = skipped = 0
+created = skipped_no_io = skipped_existing = 0
 ## THIS IS WHERE I'M CREATING THE DATASET (PUT CODE IN TO HELP WITH CHECKING IF THE TRACE ALREADY EXISTS IN THE DATASET)
+_existing_item_ids, _existing_source_trace_ids = _list_existing_dataset_entries(DATASET_NAME)
+
 for t in traces_user:  # <-- use the filtered set here
     i, o, obs_id = pick_best_io(t)
     if i is None and o is None:
-        skipped += 1
+        skipped_no_io += 1
+        continue
+    ds_item_id = f"{DATASET_NAME}_dsitem_{t.id}"
+    if ds_item_id in _existing_item_ids or str(t.id) in _existing_source_trace_ids:
+        skipped_existing += 1
         continue
     # High-level helper is fine (snake_case, supports id in recent SDKs)
     langfuse.create_dataset_item(
         dataset_name=DATASET_NAME,
-        id=f"{DATASET_NAME}_dsitem_{t.id}",         # upsert key to avoid duplicates
+        id=ds_item_id,         # upsert key to avoid duplicates
         input=i,
         expected_output=o,
         source_trace_id=t.id,
@@ -173,8 +201,11 @@ for t in traces_user:  # <-- use the filtered set here
         metadata={"name": getattr(t, "name", None)}
     )
     created += 1
+    # Keep sets updated in case of duplicate traces in the same run
+    _existing_item_ids.add(ds_item_id)
+    _existing_source_trace_ids.add(str(t.id))
 
-print(f"Created: {created} | Skipped (no I/O): {skipped}")
+print(f"Created: {created} | Skipped (no I/O): {skipped_no_io} | Skipped (already exists): {skipped_existing}")
 
 ##############################################################################
 ##############################################################################
