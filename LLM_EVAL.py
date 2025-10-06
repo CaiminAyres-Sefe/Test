@@ -177,11 +177,75 @@ def pick_best_io(trace):
             return oi, oo, getattr(o, "id", None)
     return None, None, None
 
+# --- Filter traces by required input prefix
+#     "Today is dd/mm/yyyy. Please identify the X-Com Trader Morning Call ..."
+_PAT_INPUT_PREFIX = re.compile(
+    r'^\s*Today\s+is\s+\d{1,2}/\d{1,2}/\d{4}\.\s*Please\s+identify\s+the\s+X-Com\s+Trader\s+Morning\s+Call',
+    re.IGNORECASE,
+)
+
+def _extract_user_text_from_messages(messages) -> Optional[str]:
+    """Best-effort extraction of the last user message content from an OpenAI-style message list."""
+    if not isinstance(messages, list):
+        return None
+    last_user = None
+    for msg in messages:
+        try:
+            role = (msg.get("role") or "").lower()
+            content = msg.get("content")
+        except Exception:
+            continue
+        if role == "user" and isinstance(content, str):
+            last_user = content
+    return last_user
+
+def _coerce_input_text_for_prefix(val) -> str:
+    """Return a plain text string suitable for prefix matching across common shapes."""
+    if isinstance(val, str):
+        return val
+    if isinstance(val, dict):
+        inner = val.get("input")
+        if isinstance(inner, str):
+            return inner
+        messages = val.get("messages")
+        extracted = _extract_user_text_from_messages(messages)
+        if extracted:
+            return extracted
+        return as_text(val)
+    if isinstance(val, list):
+        extracted = _extract_user_text_from_messages(val)
+        if extracted:
+            return extracted
+        try:
+            joined = "\n".join([s for s in val if isinstance(s, str)])
+            if joined:
+                return joined
+        except Exception:
+            pass
+        return as_text(val)
+    return as_text(val)
+
+def _input_matches_required_prefix(text: Optional[str]) -> bool:
+    if not isinstance(text, str) or not text:
+        return False
+    return bool(_PAT_INPUT_PREFIX.match(text))
+
+# Build filtered trace list up-front
+traces_filtered = []
+for _t in traces_user:
+    _inp, _out, _ = pick_best_io(_t)
+    if _inp is None:
+        continue
+    if _input_matches_required_prefix(_coerce_input_text_for_prefix(_inp)):
+        traces_filtered.append(_t)
+
+print(f"Filtered Morning Call traces: {len(traces_filtered)}/{len(traces_user)}")
+
 created = skipped_no_io = skipped_existing = 0
 ## THIS IS WHERE I'M CREATING THE DATASET (PUT CODE IN TO HELP WITH CHECKING IF THE TRACE ALREADY EXISTS IN THE DATASET)
 _existing_item_ids, _existing_source_trace_ids = _list_existing_dataset_entries(DATASET_NAME)
 
-for t in traces_user:  # <-- use the filtered set here
+for t in traces_filtered:  # <-- use the filtered set here
     i, o, obs_id = pick_best_io(t)
     if i is None and o is None:
         skipped_no_io += 1
@@ -275,12 +339,12 @@ for it in paginate_items(DATASET_NAME, page_size=100):
 df = pd.DataFrame(items).drop_duplicates(subset=["id"]).reset_index(drop=True)
 
 # 2) Filter dataset items to traces from THIS run/user (avoid older items in dataset)
-current_trace_ids = {t.id for t in traces_user}
+current_trace_ids = {t.id for t in traces_filtered}
 df = df[df["source_trace_id"].isin(current_trace_ids)].copy()
 df = df[df["source_trace_id"].notna()].copy()  # drop unlinked items if any
 
 # 3) Hydrate exactly the same traces; build model lookup
-traces_full = hydrate_traces(traces_user, langfuse)
+traces_full = hydrate_traces(traces_filtered, langfuse)
 df_models = (
     build_df_from_traces(traces_full)[["trace_id", "model"]]
     .dropna(subset=["trace_id"])                      # defensive
@@ -293,7 +357,7 @@ df_models["trace_id"]    = df_models["trace_id"].astype(str)
 
 
 # Build a mapping from trace id -> trace name
-id_to_name = {str(t.id): getattr(t, "name", None) for t in traces_user}
+id_to_name = {str(t.id): getattr(t, "name", None) for t in traces_filtered}
 
 # Add a human-friendly column with the trace name for each dataset row
 df["Bot"] = df["source_trace_id"].map(id_to_name)
